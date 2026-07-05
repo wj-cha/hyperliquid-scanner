@@ -1,0 +1,10 @@
+{
+  "watchlist": ["BTC", "ETH", "SOL"],
+  "interval": "1h",
+  "rsiPeriod": 14,
+  "rsiExtreme": 25,
+  "useFunding": true,
+  "fundingPercentile": 10,
+  "atrMult": 1.5,
+  "rr": 2
+}

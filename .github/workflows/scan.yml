@@ -23,9 +23,17 @@ jobs:
       - run: node scan.js
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-      - name: 신호 기록 커밋 (signals.log)
+      - name: 신호 기록 커밋 (signals.log) + Claude 루틴 호출
         if: always()         # 스캔 실패 시에도 SCANNER_FAIL 기록은 커밋
+        env:
+          CLAUDE_ROUTINE_URL: ${{ secrets.CLAUDE_ROUTINE_URL }}  # 미등록이면 루틴 호출 건너뜀
         run: |
+          # 이번 실행에서 새로 추가된 신호 줄 추출 (커밋 전에, SCANNER_FAIL 제외)
+          if git ls-files --error-unmatch signals.log >/dev/null 2>&1; then
+            NEW_SIGNALS=$(git diff --unified=0 -- signals.log | sed -n 's/^+\([^+].*\)/\1/p' | grep -v SCANNER_FAIL || true)
+          else
+            NEW_SIGNALS=$(grep -v '^#' signals.log 2>/dev/null | grep -v SCANNER_FAIL || true)
+          fi
           if [ -n "$(git status --porcelain signals.log)" ]; then
             git config user.name "hl-scanner[bot]"
             git config user.email "actions@users.noreply.github.com"
@@ -33,4 +41,11 @@ jobs:
             git commit -m "신호 기록 $(date -u +%Y-%m-%dT%H:%M)Z"
             git pull --rebase origin main
             git push origin HEAD:main
+          fi
+          # 새 신호가 있으면 Claude 루틴(API 트리거)에 신호 내용을 실어 호출
+          if [ -n "$CLAUDE_ROUTINE_URL" ] && [ -n "$NEW_SIGNALS" ]; then
+            curl -sS -m 15 -X POST "$CLAUDE_ROUTINE_URL" \
+              -H 'Content-Type: application/json' \
+              --data "$(jq -n --arg s "$NEW_SIGNALS" '{prompt: ("새 신호 발생:\n" + $s)}')" \
+              && echo "Claude 루틴 호출 완료" || echo "Claude 루틴 호출 실패 (알림은 ntfy로 이미 발송됨)"
           fi

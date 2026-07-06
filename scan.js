@@ -2,7 +2,10 @@
 // Node 20+ (fetch 내장), 외부 의존성 없음.
 // 로직은 계산기 HTML의 백테스트/스캐너 탭과 동일:
 //   봉 마감 기준 RSI 극단 + 최근 60일 펀딩비 백분위 극단 → 반전 베팅 시그널
-// 중복 알림 방지: "직전 봉에는 조건이 없었고 이번 봉에 새로 발생"했을 때만 알림 (무상태 설계)
+// 중복 알림 방지 (2중):
+//   1) "직전 봉에는 조건이 없었고 이번 봉에 새로 발생"했을 때만 알림 (봉 단위)
+//   2) signals.log에 알림 보낸 봉을 기록 — 같은 봉 안에서 여러 번 실행돼도 재알림 안 함
+//      (signals.log는 워크플로가 저장소에 커밋하므로 실전 신호 기록 겸용)
 
 const fs = require('fs');
 const CFG = JSON.parse(fs.readFileSync(__dirname + '/config.json', 'utf-8'));
@@ -12,16 +15,55 @@ const API = 'https://api.hyperliquid.xyz/info';
 // 화면 표시명 → API 심볼 별칭
 const ALIAS = { WTIOIL: 'xyz:CL', SAMSUNG: 'xyz:SMSN', SKHYNIX: 'xyz:SKHX', BRENTOIL: 'xyz:BRENTOIL' };
 const IV_MS = { '15m': 9e5, '1h': 36e5, '4h': 144e5 };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-/* ---------- API (호출 간격 제한 + 429 재시도) ---------- */
+/* ---------- config 검증 (오타를 API 에러가 아닌 명확한 메시지로) ---------- */
+function validateConfig(c) {
+  const errs = [];
+  if (!Array.isArray(c.watchlist) || !c.watchlist.length) errs.push('watchlist: 비어있지 않은 배열이어야 함');
+  if (!IV_MS[c.interval]) errs.push(`interval: ${Object.keys(IV_MS).join('/')} 중 하나여야 함 (현재 "${c.interval}")`);
+  if (!(c.rsiPeriod >= 2)) errs.push('rsiPeriod: 2 이상 숫자여야 함');
+  if (!(c.rsiExtreme > 0 && c.rsiExtreme < 50)) errs.push('rsiExtreme: 0~50 사이 숫자여야 함');
+  if (typeof c.useFunding !== 'boolean') errs.push('useFunding: true 또는 false여야 함');
+  if (c.useFunding && !(c.fundingPercentile > 0 && c.fundingPercentile < 50)) errs.push('fundingPercentile: 0~50 사이 숫자여야 함');
+  if (!(c.atrMult > 0)) errs.push('atrMult: 0보다 큰 숫자여야 함');
+  if (!(c.rr > 0)) errs.push('rr: 0보다 큰 숫자여야 함');
+  if (errs.length) {
+    console.error('config.json 설정 오류:\n - ' + errs.join('\n - '));
+    process.exit(1);
+  }
+}
+
+/* ---------- 신호 기록 (signals.log: 같은 봉 재알림 방지 + 실전 기록) ---------- */
+const LOG_FILE = __dirname + '/signals.log';
+function readLog() {
+  try { return fs.readFileSync(LOG_FILE, 'utf-8').split('\n').filter(l => l && l[0] !== '#'); }
+  catch { return []; }
+}
+function appendLog(cols) {
+  if (!fs.existsSync(LOG_FILE))
+    fs.writeFileSync(LOG_FILE, '# 알림시각\t종목\t방향\t신호봉시각\tRSI\t현재가\t손절\t목표\n');
+  fs.appendFileSync(LOG_FILE, cols.join('\t') + '\n');
+}
+
+/* ---------- API (호출 간격 제한 + 타임아웃 + 429·네트워크 오류 재시도) ---------- */
 let lastCall = 0;
 async function api(body) {
   for (let a = 0; a < 5; a++) {
     const wait = Math.max(0, lastCall + 300 - Date.now());
-    if (wait) await new Promise(r => setTimeout(r, wait));
+    if (wait) await sleep(wait);
     lastCall = Date.now();
-    const r = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    if (r.status === 429) { await new Promise(r2 => setTimeout(r2, 2000 * (a + 1))); continue; }
+    let r;
+    try {
+      r = await fetch(API, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(15000)
+      });
+    } catch (e) {
+      if (a === 4) throw new Error('API 응답 없음: ' + e.message);
+      await sleep(1500 * (a + 1)); continue;
+    }
+    if (r.status === 429) { await sleep(2000 * (a + 1)); continue; }
     if (!r.ok) throw new Error('API ' + r.status);
     return r.json();
   }
@@ -63,13 +105,14 @@ async function fetchCandles(coin, interval, bars) {
   return raw.map(k => ({ t: k.t, o: +k.o, h: +k.h, l: +k.l, c: +k.c }));
 }
 async function fetchFunding(coin, startTime) {
+  // 페이지 크기를 가정하지 않고, 새 데이터가 더 안 나올 때까지 반복 (최대 60회)
   let out = [], t = startTime;
   for (let i = 0; i < 60; i++) {
     const chunk = await api({ type: 'fundingHistory', coin, startTime: t });
     if (!chunk.length) break;
     out = out.concat(chunk);
     const last = chunk[chunk.length - 1].time;
-    if (chunk.length < 400 || last <= t) break;
+    if (last <= t) break;
     t = last + 1;
   }
   return out.map(f => ({ t: f.time, r: parseFloat(f.fundingRate) }));
@@ -113,19 +156,35 @@ async function notify(title, msg) {
   try {
     await fetch('https://ntfy.sh/' + encodeURIComponent(NTFY_TOPIC), {
       method: 'POST', body: msg,
-      headers: { 'Title': title, 'Priority': 'high', 'Tags': 'rotating_light' }
+      headers: { 'Title': title, 'Priority': 'high', 'Tags': 'rotating_light' },
+      signal: AbortSignal.timeout(10000)
     });
   } catch (e) { console.log('  → ntfy 발송 실패:', e.message); }
 }
 
 /* ---------- 메인 ---------- */
 (async () => {
+  validateConfig(CFG);
   const { interval, rsiPeriod, rsiExtreme, useFunding, fundingPercentile, atrMult, rr } = CFG;
+  const logLines = readLog();
   console.log(`=== HL 스캐너 시작 ${new Date().toISOString()} ===`);
   console.log(`조건: RSI(${rsiPeriod}) ≤${rsiExtreme} 롱 / ≥${100 - rsiExtreme} 숏` +
     (useFunding ? ` + 펀딩 ${fundingPercentile}% 극단(60일)` : '') + ` · ${interval}봉`);
 
-  const coins = await resolveNames(CFG.watchlist);
+  // 전체 실패 처리: 스캐너가 조용히 죽어있지 않도록 폰으로도 통지 — 단 6시간에 1회만 (로그로 중복 방지)
+  async function totalFailure(reason) {
+    console.log(`전체 실패: ${reason}`);
+    const lastFail = logLines.filter(l => l.split('\t')[1] === 'SCANNER_FAIL').pop();
+    if (!lastFail || Date.now() - Date.parse(lastFail.split('\t')[0]) > 6 * 36e5) {
+      await notify('HL 스캐너 오류', `${reason} — GitHub Actions 로그 확인 필요`);
+      appendLog([new Date().toISOString(), 'SCANNER_FAIL', '-', '-', reason]);
+    }
+    process.exit(1);
+  }
+
+  let coins;
+  try { coins = await resolveNames(CFG.watchlist); }
+  catch (e) { return totalFailure(`종목명 조회 실패 (${e.message})`); }
   console.log('감시 종목:', coins.join(', '));
   let alerts = 0, errors = 0;
 
@@ -172,15 +231,22 @@ async function notify(title, msg) {
         ` → ${nowSig ? nowSig + ' 시그널' + (fresh ? ' (신규!)' : ' (지속 — 알림 생략)') : '대기'}`);
 
       if (fresh) {
-        const d = nowSig === '롱' ? 1 : -1;
-        const stop = px - d * atrMult * atr, tgt = px + d * atrMult * atr * rr;
-        await notify(`HL 시그널: ${coin} ${nowSig}`,
-          `${coin} ${nowSig} | RSI ${rsi[rsi.length - 1].toFixed(1)} | 현재가 ${fmtP(px)} · 손절≈${fmtP(stop)} · 목표≈${fmtP(tgt)} | 계산기 판정 필수`);
-        alerts++;
+        // 같은 봉에 대해 이미 알림을 보냈으면 생략 (5분 크론이 1시간 봉 안에서 여러 번 돌아도 1회만)
+        const barT = new Date(closed[closed.length - 1].t).toISOString();
+        if (logLines.some(l => { const p = l.split('\t'); return p[1] === coin && p[3] === barT; })) {
+          console.log(`  → 같은 봉(${barT})에 이미 알림 발송됨 — 생략`);
+        } else {
+          const d = nowSig === '롱' ? 1 : -1;
+          const stop = px - d * atrMult * atr, tgt = px + d * atrMult * atr * rr;
+          await notify(`HL 시그널: ${coin} ${nowSig}`,
+            `${coin} ${nowSig} | RSI ${rsi[rsi.length - 1].toFixed(1)} | 현재가 ${fmtP(px)} · 손절≈${fmtP(stop)} · 목표≈${fmtP(tgt)} | 계산기 판정 필수`);
+          appendLog([new Date().toISOString(), coin, nowSig, barT, rsi[rsi.length - 1].toFixed(1), fmtP(px), fmtP(stop), fmtP(tgt)]);
+          alerts++;
+        }
       }
     } catch (e) { console.log(`${coin}: 오류 — ${e.message}`); errors++; }
   }
   console.log(`=== 완료: 알림 ${alerts}건, 오류 ${errors}건 ===`);
   // 오류가 있어도 exit 0 (다음 주기에 재시도) — 전 종목 실패 시에만 실패 처리
-  if (errors && errors >= coins.length) process.exit(1);
+  if (errors && errors >= coins.length) await totalFailure(`전 종목(${coins.length}개) 조회 실패`);
 })();

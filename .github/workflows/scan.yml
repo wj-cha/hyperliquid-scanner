@@ -4,6 +4,13 @@ on:
     - cron: "*/5 * * * *"   # 5분마다 (GitHub 사정으로 몇 분 지연될 수 있음)
   workflow_dispatch:         # Actions 탭에서 수동 실행 버튼 활성화 (테스트용)
 
+permissions:
+  contents: write            # signals.log 커밋용
+
+concurrency:
+  group: hl-scan             # 실행이 겹치면 순서대로 (signals.log 커밋 충돌 방지)
+  cancel-in-progress: false
+
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -16,3 +23,14 @@ jobs:
       - run: node scan.js
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      - name: 신호 기록 커밋 (signals.log)
+        if: always()         # 스캔 실패 시에도 SCANNER_FAIL 기록은 커밋
+        run: |
+          if [ -n "$(git status --porcelain signals.log)" ]; then
+            git config user.name "hl-scanner[bot]"
+            git config user.email "actions@users.noreply.github.com"
+            git add signals.log
+            git commit -m "신호 기록 $(date -u +%Y-%m-%dT%H:%M)Z"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi

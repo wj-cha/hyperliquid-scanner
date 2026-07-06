@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"   # 5분마다 (GitHub 사정으로 몇 분 지연될 수 있음)
   workflow_dispatch:         # Actions 탭에서 수동 실행 버튼 활성화 (테스트용)
+    inputs:
+      test_routine:
+        description: 'Claude 루틴 호출 테스트 (더미 텍스트 전송, signals.log에는 기록 안 함)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write            # signals.log 커밋용
@@ -29,12 +34,17 @@ jobs:
           # 둘 다 미등록이면 루틴 호출 건너뜀 (URL: 루틴 편집 화면의 API 트리거 URL, TOKEN: 같은 화면에서 생성한 토큰)
           CLAUDE_ROUTINE_URL: ${{ secrets.CLAUDE_ROUTINE_URL }}
           CLAUDE_ROUTINE_TOKEN: ${{ secrets.CLAUDE_ROUTINE_TOKEN }}
+          TEST_ROUTINE: ${{ inputs.test_routine }}  # 수동 실행에서만 값 존재
         run: |
           # 이번 실행에서 새로 추가된 신호 줄 추출 (커밋 전에, SCANNER_FAIL 제외)
           if git ls-files --error-unmatch signals.log >/dev/null 2>&1; then
             NEW_SIGNALS=$(git diff --unified=0 -- signals.log | sed -n 's/^+\([^+].*\)/\1/p' | grep -v SCANNER_FAIL || true)
           else
             NEW_SIGNALS=$(grep -v '^#' signals.log 2>/dev/null | grep -v SCANNER_FAIL || true)
+          fi
+          # 루틴 호출 테스트 모드: 더미 텍스트를 전송 (signals.log·커밋에는 영향 없음)
+          if [ "$TEST_ROUTINE" = "true" ]; then
+            NEW_SIGNALS="[연동 테스트] 실제 신호 아님 — 이 문장이 보이면 워크플로→루틴 연결 성공. 브리핑 대신 수신 확인만 답할 것."
           fi
           if [ -n "$(git status --porcelain signals.log)" ]; then
             git config user.name "hl-scanner[bot]"

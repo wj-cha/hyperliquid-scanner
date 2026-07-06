@@ -26,7 +26,9 @@ jobs:
       - name: 신호 기록 커밋 (signals.log) + Claude 루틴 호출
         if: always()         # 스캔 실패 시에도 SCANNER_FAIL 기록은 커밋
         env:
-          CLAUDE_ROUTINE_URL: ${{ secrets.CLAUDE_ROUTINE_URL }}  # 미등록이면 루틴 호출 건너뜀
+          # 둘 다 미등록이면 루틴 호출 건너뜀 (URL: 루틴 편집 화면의 API 트리거 URL, TOKEN: 같은 화면에서 생성한 토큰)
+          CLAUDE_ROUTINE_URL: ${{ secrets.CLAUDE_ROUTINE_URL }}
+          CLAUDE_ROUTINE_TOKEN: ${{ secrets.CLAUDE_ROUTINE_TOKEN }}
         run: |
           # 이번 실행에서 새로 추가된 신호 줄 추출 (커밋 전에, SCANNER_FAIL 제외)
           if git ls-files --error-unmatch signals.log >/dev/null 2>&1; then
@@ -42,10 +44,14 @@ jobs:
             git pull --rebase origin main
             git push origin HEAD:main
           fi
-          # 새 신호가 있으면 Claude 루틴(API 트리거)에 신호 내용을 실어 호출
-          if [ -n "$CLAUDE_ROUTINE_URL" ] && [ -n "$NEW_SIGNALS" ]; then
+          # 새 신호가 있으면 Claude 루틴(API 트리거 /fire 엔드포인트)에 신호 내용을 실어 호출
+          # 형식: https://code.claude.com/docs/en/routines#trigger-a-routine
+          if [ -n "$CLAUDE_ROUTINE_URL" ] && [ -n "$CLAUDE_ROUTINE_TOKEN" ] && [ -n "$NEW_SIGNALS" ]; then
             curl -sS -m 15 -X POST "$CLAUDE_ROUTINE_URL" \
-              -H 'Content-Type: application/json' \
-              --data "$(jq -n --arg s "$NEW_SIGNALS" '{prompt: ("새 신호 발생:\n" + $s)}')" \
+              -H "Authorization: Bearer $CLAUDE_ROUTINE_TOKEN" \
+              -H "anthropic-beta: experimental-cc-routine-2026-04-01" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "Content-Type: application/json" \
+              --data "$(jq -n --arg s "$NEW_SIGNALS" '{text: ("새 신호 발생 (알림시각/종목/방향/신호봉시각/RSI/현재가/손절/목표):\n" + $s)}')" \
               && echo "Claude 루틴 호출 완료" || echo "Claude 루틴 호출 실패 (알림은 ntfy로 이미 발송됨)"
           fi

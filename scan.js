@@ -6,6 +6,8 @@
 //   1) "직전 봉에는 조건이 없었고 이번 봉에 새로 발생"했을 때만 알림 (봉 단위)
 //   2) signals.log에 알림 보낸 봉을 기록 — 같은 봉 안에서 여러 번 실행돼도 재알림 안 함
 //      (signals.log는 워크플로가 저장소에 커밋하므로 실전 신호 기록 겸용)
+//   3) 쿨다운: 같은 종목·같은 방향 신호가 아직 미결(손절/목표/48봉 만료 전)이면 새 알림 생략
+// 결과 추적: 미결 신호를 매 실행마다 캔들로 판정해 outcomes.log에 기록 (손절·목표·만료, R 배수)
 
 const fs = require('fs');
 const CFG = JSON.parse(fs.readFileSync(__dirname + '/config.json', 'utf-8'));
@@ -28,6 +30,7 @@ function validateConfig(c) {
   if (c.useFunding && !(c.fundingPercentile > 0 && c.fundingPercentile < 50)) errs.push('fundingPercentile: 0~50 사이 숫자여야 함');
   if (!(c.atrMult > 0)) errs.push('atrMult: 0보다 큰 숫자여야 함');
   if (!(c.rr > 0)) errs.push('rr: 0보다 큰 숫자여야 함');
+  if (c.cooldown !== undefined && typeof c.cooldown !== 'boolean') errs.push('cooldown: true 또는 false여야 함');
   if (errs.length) {
     console.error('config.json 설정 오류:\n - ' + errs.join('\n - '));
     process.exit(1);
@@ -45,6 +48,23 @@ function appendLog(cols) {
     fs.writeFileSync(LOG_FILE, '# 알림시각\t종목\t방향\t신호봉시각\tRSI\t현재가\t손절\t목표\n');
   fs.appendFileSync(LOG_FILE, cols.join('\t') + '\n');
 }
+
+/* ---------- 결과 기록 (outcomes.log: 신호별 손절/목표/만료 판정) ---------- */
+const OUT_FILE = __dirname + '/outcomes.log';
+const MAX_HOLD = 48; // 백테스트와 동일한 최대 보유 봉 수
+function readOutcomes() {
+  try { return fs.readFileSync(OUT_FILE, 'utf-8').split('\n').filter(l => l && l[0] !== '#'); }
+  catch { return []; }
+}
+function appendOutcome(cols) {
+  if (!fs.existsSync(OUT_FILE))
+    fs.writeFileSync(OUT_FILE, '# 판정시각\t종목\t방향\t신호봉시각\t결과\t진입\t청산가\tR\t보유봉수\n');
+  fs.appendFileSync(OUT_FILE, cols.join('\t') + '\n');
+}
+const sigKey = (coin, barT) => coin + '|' + barT;
+const num = x => parseFloat(String(x).replace(/,/g, ''));
+// signals.log의 신호 줄 (SCANNER_FAIL 제외)
+const signalRows = lines => lines.map(l => l.split('\t')).filter(p => p[1] !== 'SCANNER_FAIL' && p.length >= 8);
 
 /* ---------- API (호출 간격 제한 + 타임아웃 + 429·네트워크 오류 재시도) ---------- */
 let lastCall = 0;
@@ -117,6 +137,43 @@ async function fetchFunding(coin, startTime) {
   }
   return out.map(f => ({ t: f.time, r: parseFloat(f.fundingRate) }));
 }
+/* ---------- 결과 판정 ---------- */
+// 알림 이후 마감된 봉부터 최대 48봉 동안 손절/목표 도달 여부 판정.
+// 알림 시점에 진행 중이던 봉은 알림 전 가격이 섞여 있어 제외. 한 봉에서 둘 다 닿으면 손절 우선(보수적).
+async function resolveOutcomes(sigLog, doneKeys, interval) {
+  const open = signalRows(sigLog).filter(p => !doneKeys.has(sigKey(p[1], p[3])));
+  const byCoin = {};
+  for (const p of open) (byCoin[p[1]] = byCoin[p[1]] || []).push(p);
+  let resolved = 0;
+  for (const coin of Object.keys(byCoin)) {
+    try {
+      const oldest = Math.min(...byCoin[coin].map(p => Date.parse(p[0])));
+      const bars = Math.min(5000, Math.ceil((Date.now() - oldest) / IV_MS[interval]) + 3);
+      const closed = (await fetchCandles(coin, interval, bars)).slice(0, -1);
+      for (const p of byCoin[coin]) {
+        const entry = num(p[5]), stop = num(p[6]), tgt = num(p[7]);
+        const d = p[2] === '롱' ? 1 : -1, risk = Math.abs(entry - stop);
+        const start = closed.findIndex(k => k.t >= Date.parse(p[0]));
+        if (start < 0 || !(risk > 0)) continue;
+        let res = null;
+        for (let i = start; i < Math.min(start + MAX_HOLD, closed.length); i++) {
+          const k = closed[i], n = i - start + 1;
+          if (d > 0 ? k.l <= stop : k.h >= stop) { res = ['손절', stop, n]; break; }
+          if (d > 0 ? k.h >= tgt : k.l <= tgt) { res = ['목표', tgt, n]; break; }
+          if (n === MAX_HOLD) res = ['만료', k.c, n];
+        }
+        if (!res) continue; // 아직 미결
+        const R = ((res[1] - entry) * d / risk).toFixed(2);
+        appendOutcome([new Date().toISOString(), coin, p[2], p[3], res[0], fmtP(entry), fmtP(res[1]), R, res[2]]);
+        doneKeys.add(sigKey(coin, p[3]));
+        console.log(`결과: ${coin} ${p[2]} (${p[3]}) → ${res[0]} ${R}R · ${res[2]}봉`);
+        resolved++;
+      }
+    } catch (e) { console.log(`${coin}: 결과 판정 오류 — ${e.message}`); }
+  }
+  if (resolved) console.log(`결과 판정 ${resolved}건 기록`);
+}
+
 async function resolveNames(list) {
   // BTC 같은 메인 심볼은 그대로, WTIOIL 같은 별칭은 변환, TSLA 같은 HIP-3 심볼은 전 dex에서 탐색
   const upper = list.map(c => c.trim().toUpperCase());
@@ -186,6 +243,16 @@ async function notify(title, msg) {
   try { coins = await resolveNames(CFG.watchlist); }
   catch (e) { return totalFailure(`종목명 조회 실패 (${e.message})`); }
   console.log('감시 종목:', coins.join(', '));
+
+  // 지난 신호 결과 판정 (실패해도 스캔은 계속)
+  const doneKeys = new Set(readOutcomes().map(l => { const p = l.split('\t'); return sigKey(p[1], p[3]); }));
+  try { await resolveOutcomes(logLines, doneKeys, interval); }
+  catch (e) { console.log('결과 판정 건너뜀:', e.message); }
+  // 쿨다운: 같은 종목·방향의 미결 신호 (48봉 지난 건 판정 실패해도 미결로 안 봄)
+  const cooldownOn = CFG.cooldown !== false;
+  const isOpen = (coin, dir) => signalRows(logLines).some(p =>
+    p[1] === coin && p[2] === dir && !doneKeys.has(sigKey(coin, p[3])) &&
+    Date.now() - Date.parse(p[0]) < (MAX_HOLD + 1) * IV_MS[interval]);
   let alerts = 0, errors = 0;
 
   for (const coin of coins) {
@@ -235,6 +302,8 @@ async function notify(title, msg) {
         const barT = new Date(closed[closed.length - 1].t).toISOString();
         if (logLines.some(l => { const p = l.split('\t'); return p[1] === coin && p[3] === barT; })) {
           console.log(`  → 같은 봉(${barT})에 이미 알림 발송됨 — 생략`);
+        } else if (cooldownOn && isOpen(coin, nowSig)) {
+          console.log(`  → 같은 방향(${nowSig}) 미결 신호가 있어 쿨다운 — 알림 생략`);
         } else {
           const d = nowSig === '롱' ? 1 : -1;
           const stop = px - d * atrMult * atr, tgt = px + d * atrMult * atr * rr;

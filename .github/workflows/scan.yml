@@ -10,7 +10,7 @@ on:
         default: false
 
 permissions:
-  contents: write            # signals.log 커밋용
+  contents: write            # signals.log·outcomes.log 커밋용
 
 concurrency:
   group: hl-scan             # 실행이 겹치면 순서대로 (signals.log 커밋 충돌 방지)
@@ -46,10 +46,11 @@ jobs:
           if [ "$TEST_ROUTINE" = "true" ]; then
             NEW_SIGNALS="[연동 테스트] 실제 신호 아님 — 이 문장이 보이면 워크플로→루틴 연결 성공. 브리핑 대신 수신 확인만 답할 것."
           fi
-          if [ -n "$(git status --porcelain signals.log)" ]; then
+          if [ -n "$(git status --porcelain signals.log outcomes.log)" ]; then
             git config user.name "hl-scanner[bot]"
             git config user.email "actions@users.noreply.github.com"
             git add signals.log
+            [ -f outcomes.log ] && git add outcomes.log
             git commit -m "신호 기록 $(date -u +%Y-%m-%dT%H:%M)Z"
             git pull --rebase origin main
             git push origin HEAD:main
